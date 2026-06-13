@@ -1,0 +1,23 @@
+[package]
+name = "linux-boot-extractor"
+version = "0.1.0"
+edition = "2024"
+description = "Extract vmlinuz / initramfs / boot configs from VM disk images (qcow2/raw) in pure userspace"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "lbx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lbx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ext4-view = "0.9"
+fatfs = "0.3"
+flate2 = "1.1.9"
+libc = "0.2.186"
+thiserror = "2"
