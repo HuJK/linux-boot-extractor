@@ -1,0 +1,8 @@
+https://images.linuxcontainers.org/images/nixos/26.05/arm64/default/20260613_01%3A03/disk.qcow2
+https://images.linuxcontainers.org/images/opensuse/tumbleweed/arm64/default/20260613_04%3A20/disk.qcow2
+https://images.linuxcontainers.org/images/fedora/44/arm64/default/20260602_20%3A33/disk.qcow2
+https://images.linuxcontainers.org/images/ubuntu/resolute/arm64/default/20260613_07%3A42/disk.qcow2
+https://images.linuxcontainers.org/images/alpine/edge/arm64/default/20260613_13%3A01/disk.qcow2
+https://images.linuxcontainers.org/images/openwrt/snapshot/arm64/default/20260613_11%3A57/disk.qcow2
+https://images.linuxcontainers.org/images/debian/trixie/arm64/default/20260613_05%3A24/disk.qcow2
+https://images.linuxcontainers.org/images/alt/p11/arm64/default/20260613_01%3A17/disk.qcow2

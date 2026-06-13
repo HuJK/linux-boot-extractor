@@ -34,6 +34,16 @@ pub trait FileSystem {
     fn read_file(&self, path: &str) -> Result<Vec<u8>>;
     fn exists(&self, path: &str) -> bool;
 
+    /// Read up to `max` bytes from the start of a regular file (symlinks
+    /// followed). For sniffing a header — e.g. a kernel's compression magic
+    /// — without pulling in the whole file. The default reads everything
+    /// and truncates; backends override it to stream just the prefix.
+    fn read_prefix(&self, path: &str, max: usize) -> Result<Vec<u8>> {
+        let mut data = self.read_file(path)?;
+        data.truncate(max);
+        Ok(data)
+    }
+
     /// Size in bytes of a regular file (symlinks followed), from inode /
     /// directory metadata only — no data is read. Callers use this as a
     /// cheap cache-validation key for files they extracted earlier.

@@ -63,6 +63,21 @@ impl FileSystem for Ext4Fs {
         Ok(self.fs.read(path)?)
     }
 
+    fn read_prefix(&self, path: &str, max: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut file = self.fs.open(path)?;
+        let mut buf = vec![0u8; max];
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    }
+
     fn exists(&self, path: &str) -> bool {
         self.fs.exists(path).unwrap_or(false)
     }

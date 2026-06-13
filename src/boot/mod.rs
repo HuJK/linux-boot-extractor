@@ -84,21 +84,38 @@ pub fn scan(fs: &dyn FileSystem) -> Result<BootScan> {
     let env = grubenv::load(fs);
     let mut configs = Vec::new();
 
-    // GRUB
-    let mut grub_scan: Option<grub::GrubScan> = None;
-    let mut uses_bls = false;
+    // GRUB. Standard rootfs locations, plus ESP-style configs under
+    // `/EFI/<vendor>/grub.cfg` (the config lives only on the EFI System
+    // Partition, with no rootfs copy — e.g. OpenWrt). The vendor subdir
+    // varies, so enumerate it; kernel paths inside are absolute on this same
+    // partition, which is how we already resolve them.
+    let mut grub_paths: Vec<String> = Vec::new();
     for prefix in BOOT_PREFIXES {
         for cfg in ["/grub/grub.cfg", "/grub2/grub.cfg"] {
-            let path = format!("{prefix}{cfg}");
-            if !fs.exists(&path) {
-                continue;
-            }
-            configs.push(path.clone());
-            if let Ok(g) = grub::parse(fs, &path, &env) {
-                uses_bls |= g.uses_bls;
-                if !g.entries.is_empty() && grub_scan.is_none() {
-                    grub_scan = Some(g);
+            grub_paths.push(format!("{prefix}{cfg}"));
+        }
+    }
+    for efi in ["/EFI", "/efi"] {
+        if let Ok(dirs) = fs.read_dir(efi) {
+            for d in dirs {
+                if d.kind == FileKind::Dir {
+                    grub_paths.push(format!("{efi}/{}/grub.cfg", d.name));
                 }
+            }
+            break; // FAT is case-insensitive; one spelling is enough
+        }
+    }
+    let mut grub_scan: Option<grub::GrubScan> = None;
+    let mut uses_bls = false;
+    for path in grub_paths {
+        if !fs.exists(&path) {
+            continue;
+        }
+        configs.push(path.clone());
+        if let Ok(g) = grub::parse(fs, &path, &env) {
+            uses_bls |= g.uses_bls;
+            if !g.entries.is_empty() && grub_scan.is_none() {
+                grub_scan = Some(g);
             }
         }
     }
@@ -180,22 +197,77 @@ fn drop_stale_entries(
     entries: Vec<BootEntry>,
     default: Option<usize>,
 ) -> (Vec<BootEntry>, Option<usize>) {
+    // Keep only entries whose kernel file actually exists on this partition.
+    // This drops kernel-less stubs (grub's "UEFI Firmware Settings"/fwsetup)
+    // and entries whose `linux` path lives on another partition — a grub.cfg
+    // that uses `search --set=root` (e.g. RHEL's ESP shim points `/boot/...`
+    // at the rootfs). Such a partition then no longer masquerades as bootable
+    // and beat the one holding the real kernel. (Transient remote-read blips
+    // are absorbed by the HTTP layer's retries.)
     let keep: Vec<bool> = entries
         .iter()
         .map(|e| e.kernel.as_deref().is_some_and(|k| fs.exists(k)))
         .collect();
-    if !keep.iter().any(|&k| k) {
-        return (entries, default);
-    }
-    let new_default = default.map(|d| keep[..d].iter().filter(|&&k| k).count());
+    let new_default = default
+        .map(|d| keep[..d].iter().filter(|&&k| k).count())
+        .filter(|_| default.is_some_and(|d| keep[d]));
     let kept: Vec<BootEntry> = entries
         .into_iter()
         .zip(&keep)
         .filter_map(|(e, &k)| k.then_some(e))
         .collect();
-    let new_default =
-        new_default.filter(|_| default.is_some_and(|d| keep[d])).or(Some(0));
+    let new_default = if kept.is_empty() { None } else { new_default.or(Some(0)) };
     (kept, new_default)
+}
+
+/// Kernel releases this entry could map to, most-specific first: the
+/// suffix of the kernel filename (`vmlinuz-<rel>` / `Image-<rel>`) matches
+/// `config-<rel>` exactly, so it is tried before the weaker BLS `version`.
+fn entry_kernel_releases(entry: &BootEntry) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(kernel) = &entry.kernel {
+        let base = kernel.rsplit('/').next().unwrap_or(kernel);
+        for p in ["vmlinuz-", "Image-", "vmlinux-", "kernel-"] {
+            if let Some(rel) = base.strip_prefix(p) {
+                out.push(rel.to_string());
+                break;
+            }
+        }
+    }
+    if let Some(v) = &entry.version
+        && !out.iter().any(|r| r == v)
+    {
+        out.push(v.clone());
+    }
+    out
+}
+
+/// True if `name=y` appears in a kernel `.config` (a `# name is not set`
+/// line, or absence, reads as disabled).
+fn kconfig_enabled(data: &[u8], name: &str) -> bool {
+    let needle = format!("{name}=y");
+    String::from_utf8_lossy(data).lines().any(|l| l.trim() == needle)
+}
+
+/// Whether this entry's kernel was built with `CONFIG_DMA_RESTRICTED_POOL=y`,
+/// read from the matching `/boot/config-<release>` file.
+///
+/// Under a gunyah/pKVM *protected* VM the guest's RAM is lent (private) and
+/// the VMM cannot read it; virtio only works if the guest routes its DMA
+/// through a host-shared restricted-dma-pool, which this option provides. A
+/// kernel without it puts the virtqueues in private memory and the VMM
+/// aborts on the first queue access. `None` = no `config-*` file to read,
+/// so undeterminable.
+pub fn dma_restricted_pool(fs: &dyn FileSystem, entry: &BootEntry) -> Option<bool> {
+    for rel in entry_kernel_releases(entry) {
+        for prefix in BOOT_PREFIXES {
+            let path = format!("{prefix}/config-{rel}");
+            if let Ok(data) = fs.read_file(&path) {
+                return Some(kconfig_enabled(&data, "CONFIG_DMA_RESTRICTED_POOL"));
+            }
+        }
+    }
+    None
 }
 
 /// Expand `$var` / `${var}` from the grubenv map; unknown vars -> empty.
@@ -463,5 +535,36 @@ mod tests {
         let scan = scan(&fs).unwrap();
         assert_eq!(scan.default, Some(1));
         assert_eq!(scan.default_entry().unwrap().cmdline.as_deref(), Some("root=/dev/vda1"));
+    }
+
+    #[test]
+    fn dma_restricted_pool_reads_matching_config() {
+        let fs = MockFs::new([
+            ("/boot/vmlinuz-6.1.0-37-arm64", "k"),
+            ("/boot/initrd.img-6.1.0-37-arm64", "i"),
+            (
+                "/boot/config-6.1.0-37-arm64",
+                "CONFIG_SWIOTLB=y\nCONFIG_DMA_RESTRICTED_POOL=y\n# CONFIG_FOO is not set\n",
+            ),
+        ]);
+        let scan = scan(&fs).unwrap();
+        assert_eq!(dma_restricted_pool(&fs, &scan.entries[0]), Some(true));
+    }
+
+    #[test]
+    fn dma_restricted_pool_disabled_when_not_set() {
+        let fs = MockFs::new([
+            ("/boot/vmlinuz-6.1.0-37-arm64", "k"),
+            ("/boot/config-6.1.0-37-arm64", "# CONFIG_DMA_RESTRICTED_POOL is not set\n"),
+        ]);
+        let scan = scan(&fs).unwrap();
+        assert_eq!(dma_restricted_pool(&fs, &scan.entries[0]), Some(false));
+    }
+
+    #[test]
+    fn dma_restricted_pool_unknown_without_config_file() {
+        let fs = MockFs::new([("/boot/vmlinuz-6.1.0-37-arm64", "k")]);
+        let scan = scan(&fs).unwrap();
+        assert_eq!(dma_restricted_pool(&fs, &scan.entries[0]), None);
     }
 }

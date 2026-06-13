@@ -68,6 +68,23 @@ impl FileSystem for VfatFs {
         Ok(buf)
     }
 
+    fn read_prefix(&self, path: &str, max: usize) -> Result<Vec<u8>> {
+        let root = self.fs.root_dir();
+        let mut file = root
+            .open_file(normalize(path))
+            .map_err(|_| Error::NotFound(path.to_string()))?;
+        let mut buf = vec![0u8; max];
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]).map_err(|e| Error::Vfat(e.to_string()))? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    }
+
     fn exists(&self, path: &str) -> bool {
         let root = self.fs.root_dir();
         let p = normalize(path);

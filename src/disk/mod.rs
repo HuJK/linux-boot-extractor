@@ -1,57 +1,51 @@
 //! Disk image formats. `open()` sniffs the format and returns a flat
 //! byte-addressable view of the *guest-visible* disk contents, opening
-//! backing file chains as needed.
+//! backing file chains as needed. The underlying bytes come from a
+//! [`source`](crate::source) — a local file or a lazily-downloaded URL —
+//! so the same code analyses a path or a cloud image.
 
 mod qcow2;
 
 pub use qcow2::Qcow2;
 
 use crate::blockdev::ReadAt;
+use crate::source::{self, Source};
 use crate::{Error, Result};
-use std::fs::File;
-use std::path::Path;
 
 const MAX_BACKING_DEPTH: u32 = 8;
 
 pub enum DiskImage {
-    Raw(File),
-    Qcow2(Qcow2<File>),
+    Raw(Source),
+    Qcow2(Qcow2<Source>),
 }
 
 impl DiskImage {
-    pub fn open(path: &Path) -> Result<DiskImage> {
-        Self::open_at_depth(path, 0)
+    /// Open `locator` — a filesystem path or an `http(s)://` URL.
+    pub fn open(locator: &str) -> Result<DiskImage> {
+        Self::open_at_depth(locator, 0)
     }
 
-    fn open_at_depth(path: &Path, depth: u32) -> Result<DiskImage> {
+    fn open_at_depth(locator: &str, depth: u32) -> Result<DiskImage> {
         if depth > MAX_BACKING_DEPTH {
             return Err(Error::Qcow2("backing file chain too deep (loop?)".into()));
         }
-        let file = File::open(path)?;
+        let src = source::open(locator)?;
         let mut magic = [0u8; 4];
         // Images shorter than 4 bytes are treated as raw.
-        if file.size() >= 4 {
-            ReadAt::read_at(&file, 0, &mut magic)?;
+        if src.size() >= 4 {
+            src.read_at(0, &mut magic)?;
         }
         if magic != qcow2::MAGIC {
-            return Ok(DiskImage::Raw(file));
+            return Ok(DiskImage::Raw(src));
         }
 
-        let mut q = Qcow2::open(file)?;
+        let mut q = Qcow2::open(src)?;
         if let Some(name) = q.backing_file().map(str::to_string) {
-            // Relative backing paths are relative to the referring image.
-            let backing_path = if name.starts_with('/') {
-                std::path::PathBuf::from(&name)
-            } else {
-                path.parent().unwrap_or(Path::new(".")).join(&name)
-            };
-            let backing =
-                Self::open_at_depth(&backing_path, depth + 1).map_err(|e| {
-                    Error::Qcow2(format!(
-                        "opening backing file {}: {e}",
-                        backing_path.display()
-                    ))
-                })?;
+            // Backing references resolve relative to the referring image.
+            let backing_locator = source::resolve_relative(locator, &name);
+            let backing = Self::open_at_depth(&backing_locator, depth + 1).map_err(|e| {
+                Error::Qcow2(format!("opening backing file {backing_locator}: {e}"))
+            })?;
             q.set_backing(Box::new(backing));
         }
         Ok(DiskImage::Qcow2(q))

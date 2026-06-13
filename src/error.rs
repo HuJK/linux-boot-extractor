@@ -45,4 +45,10 @@ pub enum Error {
 
     #[error("no boot artifacts (kernel/initramfs) found in any partition")]
     NoBootArtifacts,
+
+    #[error("kernel decompression: {0}")]
+    KernelDecompress(String),
+
+    #[error("remote image: {0}")]
+    Http(String),
 }

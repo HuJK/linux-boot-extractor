@@ -14,36 +14,47 @@ use std::sync::Arc;
 /// Read kernels, initramfs and boot configs out of VM disk images
 /// (qcow2/raw) without mounting anything.
 ///
-/// Files are addressed as URIs: `p2:/boot/vmlinuz` reads from partition 2;
-/// a bare `/boot/vmlinuz` searches every readable partition.
+/// The image may be a local path or an `http(s)://` URL — a remote image is
+/// analysed lazily, downloading only the ranges actually read. Files inside
+/// it are addressed as URIs: `p2:/boot/vmlinuz` reads from partition 2; a
+/// bare `/boot/vmlinuz` searches every readable partition.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Cache downloaded chunks of remote (URL) images here for reuse across
+    /// runs. Layout: <dir>/<md5(url)>/<chunk-index>.
+    #[arg(long, global = true, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+    /// Per-connection network timeout in seconds for remote (URL) images.
+    /// Each chunk uses a fresh connection, so a chunk whose connect or read
+    /// stalls this long fails (default 60).
+    #[arg(long, global = true, value_name = "SECS")]
+    timeout: Option<u64>,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Show image format and partition table
-    Info { image: PathBuf },
+    Info { image: String },
     /// Show the boot entry the bootloader would pick (kernel/initrd/cmdline)
     BootInfo {
-        image: PathBuf,
+        image: String,
         /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
     /// List all boot entries found in the image
     Entries {
-        image: PathBuf,
+        image: String,
         /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
     /// List directory contents (path may be a `pN:/...` URI)
     Ls {
-        image: PathBuf,
+        image: String,
         #[arg(default_value = "/")]
         path: String,
         /// Partition index (alternative to a `pN:` URI prefix)
@@ -52,23 +63,42 @@ enum Command {
     },
     /// Write a file from the image to stdout (path may be a `pN:/...` URI)
     Cat {
-        image: PathBuf,
+        image: String,
         path: String,
         #[arg(short, long)]
         part: Option<usize>,
     },
     /// Copy a file out of the image (source may be a `pN:/...` URI)
     Cp {
-        image: PathBuf,
+        image: String,
         source: String,
         /// Destination file or directory
         dest: PathBuf,
         #[arg(short, long)]
         part: Option<usize>,
+        /// If the source is a compressed kernel (gzip `Image.gz` or EFI
+        /// zboot), write the decompressed raw `Image` a VMM can direct-boot
+        /// (see `entries`' `kernel_compression`); a no-op for anything else
+        #[arg(long)]
+        decompress: bool,
+    },
+    /// Print the MD5 of a file in the image, `md5sum`-style (the path may
+    /// be a `pN:/...` URI). For comparing an in-image kernel/initrd against
+    /// an already-extracted copy without mounting the image.
+    Md5 {
+        image: String,
+        path: String,
+        #[arg(short, long)]
+        part: Option<usize>,
+        /// MD5 the decompressed kernel (as `cp --decompress`/`extract
+        /// --decompress` would write it) rather than the raw stored bytes,
+        /// so the digest matches the extracted file
+        #[arg(long)]
+        decompress: bool,
     },
     /// Find and extract kernel + initramfs + boot configs
     Extract {
-        image: PathBuf,
+        image: String,
         /// Output directory
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
@@ -83,9 +113,13 @@ enum Command {
         /// extracted cmdline (for direct-kernel boot under virtio)
         #[arg(long)]
         vdafix: bool,
+        /// Decompress a gzip/zboot-wrapped kernel into the raw `Image` a
+        /// VMM can direct-boot, instead of copying the stored bytes verbatim
+        #[arg(long)]
+        decompress: bool,
     },
     /// Interactive shell for poking around the image (ls/cd/cat/cp/...)
-    Shell { image: PathBuf },
+    Shell { image: String },
 }
 
 fn main() -> Result<()> {
@@ -95,16 +129,23 @@ fn main() -> Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
-    let cli = Cli::parse();
-    match cli.command {
+    let Cli { command, cache_dir, timeout } = Cli::parse();
+    lbx::source::set_cache_dir(cache_dir);
+    lbx::source::set_http_timeout(timeout);
+    match command {
         Command::Info { image } => cmd_info(&image),
         Command::BootInfo { image, json } => cmd_boot_info(&image, json),
         Command::Entries { image, json } => cmd_entries(&image, json),
         Command::Ls { image, path, part } => cmd_ls(&image, &path, part),
         Command::Cat { image, path, part } => cmd_cat(&image, &path, part),
-        Command::Cp { image, source, dest, part } => cmd_cp(&image, &source, &dest, part),
-        Command::Extract { image, output, entry, dry_run, vdafix } => {
-            cmd_extract(&image, &output, entry, dry_run, vdafix)
+        Command::Cp { image, source, dest, part, decompress } => {
+            cmd_cp(&image, &source, &dest, part, decompress)
+        }
+        Command::Md5 { image, path, part, decompress } => {
+            cmd_md5(&image, &path, part, decompress)
+        }
+        Command::Extract { image, output, entry, dry_run, vdafix, decompress } => {
+            cmd_extract(&image, &output, entry, dry_run, vdafix, decompress)
         }
         Command::Shell { image } => {
             let disk = open_disk(&image)?;
@@ -130,9 +171,9 @@ pub(crate) fn uri(part: usize, path: &str) -> String {
     format!("p{part}:{path}")
 }
 
-fn open_disk(image: &Path) -> Result<Arc<DiskImage>> {
+fn open_disk(image: &str) -> Result<Arc<DiskImage>> {
     Ok(Arc::new(
-        DiskImage::open(image).with_context(|| format!("opening {}", image.display()))?,
+        DiskImage::open(image).with_context(|| format!("opening {image}"))?,
     ))
 }
 
@@ -194,7 +235,7 @@ fn best_boot_scan(disk: &Arc<DiskImage>) -> Result<Option<PartScan>> {
     Ok(best)
 }
 
-fn cmd_info(image: &Path) -> Result<()> {
+fn cmd_info(image: &str) -> Result<()> {
     let disk = open_disk(image)?;
     println!("format: {}", disk.format());
     println!("virtual size: {} ({} bytes)", human_size(disk.size()), disk.size());
@@ -248,7 +289,17 @@ pub(crate) fn entry_label(entry: &BootEntry) -> &str {
         .unwrap_or("(untitled)")
 }
 
-fn cmd_boot_info(image: &Path, json: bool) -> Result<()> {
+/// The compression wrapping this entry's kernel (gzip `Image.gz` or EFI
+/// zboot), sniffed from a header prefix, or `None` for an already-raw
+/// kernel / x86 bzImage. A direct-kernel-boot caller uses it to decide
+/// whether to extract the kernel with `--decompress`.
+fn kernel_compression(fs: &dyn FileSystem, entry: &BootEntry) -> Option<lbx::kernel::Compression> {
+    let kernel = entry.kernel.as_ref()?;
+    let head = fs.read_prefix(kernel, lbx::kernel::SNIFF_LEN).ok()?;
+    lbx::kernel::compression(&head)
+}
+
+fn cmd_boot_info(image: &str, json: bool) -> Result<()> {
     let disk = open_disk(image)?;
     let Some((p, fs, scan)) = best_boot_scan(&disk)? else {
         bail!("no boot artifacts (kernel/initramfs) found in any partition");
@@ -280,11 +331,14 @@ fn cmd_boot_info(image: &Path, json: bool) -> Result<()> {
     } else {
         println!("cmdline: (unknown — entry came from {} scan)", entry.source);
     }
+    if let Some(c) = kernel_compression(fs.as_ref(), entry) {
+        println!("compression: {} (extract with --decompress for direct-kernel boot)", c.label());
+    }
     println!("source:  {}", entry.source);
     Ok(())
 }
 
-fn cmd_entries(image: &Path, json: bool) -> Result<()> {
+fn cmd_entries(image: &str, json: bool) -> Result<()> {
     let disk = open_disk(image)?;
     let table = part::scan(disk.as_ref())?;
     let mut found = false;
@@ -314,6 +368,12 @@ fn cmd_entries(image: &Path, json: bool) -> Result<()> {
             let mark = if Some(i) == scan.default { "*" } else { " " };
             println!("{mark} [{}] {} ({})", i + 1, entry_label(entry), entry.source);
             print_entry(p.index, entry, fixed_cmdline(entry, &table).as_deref());
+            if let Some(c) = kernel_compression(fs.as_ref(), entry) {
+                println!("      note: compressed kernel ({}); extract with --decompress for direct-kernel boot", c.label());
+            }
+            if lbx::boot::dma_restricted_pool(fs.as_ref(), entry) == Some(false) {
+                println!("      note: kernel lacks CONFIG_DMA_RESTRICTED_POOL; virtio fails under a protected VM");
+            }
         }
     }
     if json {
@@ -326,7 +386,7 @@ fn cmd_entries(image: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ls(image: &Path, path: &str, part: Option<usize>) -> Result<()> {
+fn cmd_ls(image: &str, path: &str, part: Option<usize>) -> Result<()> {
     let disk = open_disk(image)?;
     let (uri_part, path) = parse_uri(path);
     let part = uri_part.or(part);
@@ -376,7 +436,7 @@ fn read_by_uri(
     );
 }
 
-fn cmd_cat(image: &Path, path: &str, part: Option<usize>) -> Result<()> {
+fn cmd_cat(image: &str, path: &str, part: Option<usize>) -> Result<()> {
     let disk = open_disk(image)?;
     let data = read_by_uri(&disk, path, part)?;
     std::io::stdout().write_all(&data)?;
@@ -394,21 +454,43 @@ pub(crate) fn write_dest(dest: &Path, source_path: &str, data: &[u8]) -> Result<
     Ok(dest)
 }
 
-fn cmd_cp(image: &Path, source: &str, dest: &Path, part: Option<usize>) -> Result<()> {
+fn cmd_cp(
+    image: &str,
+    source: &str,
+    dest: &Path,
+    part: Option<usize>,
+    decompress: bool,
+) -> Result<()> {
     let disk = open_disk(image)?;
-    let data = read_by_uri(&disk, source, part)?;
+    let mut data = read_by_uri(&disk, source, part)?;
+    if decompress {
+        data = lbx::kernel::to_bootable(data)?;
+    }
     let (_, path) = parse_uri(source);
     let written = write_dest(dest, &path, &data)?;
     println!("{} -> {} ({})", source, written.display(), human_size(data.len() as u64));
     Ok(())
 }
 
+fn cmd_md5(image: &str, path: &str, part: Option<usize>, decompress: bool) -> Result<()> {
+    let disk = open_disk(image)?;
+    let mut data = read_by_uri(&disk, path, part)?;
+    if decompress {
+        data = lbx::kernel::to_bootable(data)?;
+    }
+    // md5sum-compatible "<hex>  <name>", so the output diffs cleanly
+    // against `md5sum` run on an extracted copy.
+    println!("{:x}  {}", md5::compute(&data), path);
+    Ok(())
+}
+
 fn cmd_extract(
-    image: &Path,
+    image: &str,
     output: &Path,
     entry_arg: Option<usize>,
     dry_run: bool,
     vdafix: bool,
+    decompress: bool,
 ) -> Result<()> {
     let disk = open_disk(image)?;
     let Some((p, fs, scan)) = best_boot_scan(&disk)? else {
@@ -445,7 +527,12 @@ fn cmd_extract(
         println!("  -> {}", dest.display());
         Ok(())
     };
-    copy(kernel)?;
+    // The kernel may be gzip/zboot-wrapped; only it gets decompressed (the
+    // initrd must stay compressed — the guest kernel unpacks it itself).
+    let kdata = fs.read_file(kernel).with_context(|| format!("reading {kernel}"))?;
+    let kdata = if decompress { lbx::kernel::to_bootable(kdata)? } else { kdata };
+    let kdest = write_dest(output, kernel, &kdata)?;
+    println!("  -> {}", kdest.display());
     for initrd in &entry.initrd {
         copy(initrd)?;
     }
@@ -510,8 +597,18 @@ fn entry_json(
     let initrd: Vec<String> = e.initrd.iter().map(|i| jstr(&uri(part, i))).collect();
     let initrd_size: Vec<String> =
         e.initrd.iter().map(|i| jsize(fs.file_size(i).ok())).collect();
+    // Whether this kernel can do virtio in a gunyah protected VM (needs
+    // CONFIG_DMA_RESTRICTED_POOL); null = could not determine.
+    let dma_restricted_pool = lbx::boot::dma_restricted_pool(fs, e)
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "null".into());
+    // Compression wrapping the kernel (gzip/zboot), so a direct-boot caller
+    // knows to extract it with `--decompress`; null = already raw.
+    let kernel_compression = kernel_compression(fs, e)
+        .map(|c| jstr(&c.label()))
+        .unwrap_or_else(|| "null".into());
     format!(
-        "{{\"partition\":{part},\"default\":{is_default},\"source\":{},\"title\":{},\"version\":{},\"id\":{},\"kernel\":{kernel},\"kernel_size\":{kernel_size},\"initrd\":[{}],\"initrd_size\":[{}],\"cmdline\":{},\"cmdline_fixed\":{}}}",
+        "{{\"partition\":{part},\"default\":{is_default},\"source\":{},\"title\":{},\"version\":{},\"id\":{},\"kernel\":{kernel},\"kernel_size\":{kernel_size},\"initrd\":[{}],\"initrd_size\":[{}],\"cmdline\":{},\"cmdline_fixed\":{},\"dma_restricted_pool\":{dma_restricted_pool},\"kernel_compression\":{kernel_compression}}}",
         jstr(&e.source.to_string()),
         jopt(&e.title),
         jopt(&e.version),

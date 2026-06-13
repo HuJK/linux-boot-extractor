@@ -1,3 +1,6 @@
 /target
-/tests
 /dist
+# tests/: keep the harness (run-boot-tests.sh, fetch-image-urls.py) and the
+# image-URL lists, but not the big downloaded disks or the chunk cache.
+tests/*.qcow2
+tests/.boot-cache/

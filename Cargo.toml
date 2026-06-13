@@ -16,8 +16,14 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-ext4-view = "0.9"
+ext4-view = { version = "0.9", features = ["std"] }
 fatfs = "0.3"
 flate2 = "1.1.9"
 libc = "0.2.186"
+md5 = "0.7"
+rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-pki-types = "1.14.1"
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12", "alloc"] }
+ruzstd = "0.8"
 thiserror = "2"
+webpki-roots = "1.0.7"
