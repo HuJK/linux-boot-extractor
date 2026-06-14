@@ -7,6 +7,7 @@ use lbx::boot::{BootEntry, BootScan, Source};
 use lbx::disk::DiskImage;
 use lbx::fsys::{self, DirEntry, FileKind, FileSystem};
 use lbx::part::{self, Partition};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,6 +48,21 @@ enum Command {
     },
     /// List all boot entries found in the image
     Entries {
+        image: String,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Skip per-entry probes a plain listing doesn't need: kernel/initrd
+        /// sizes and kernel-compression sniffing (these become null). Cuts
+        /// remote reads when analysing a URL image for a quick entry preview;
+        /// `dma_restricted_pool` and `cmdline_fixed` are still reported.
+        #[arg(long)]
+        quick: bool,
+    },
+    /// Report features a direct crosvm boot can't read (zlib-compressed
+    /// qcow2 clusters). lbx reads these fine, but crosvm returns I/O errors,
+    /// so the guest sees a disk with no readable partition table.
+    Compat {
         image: String,
         /// Machine-readable output
         #[arg(long)]
@@ -135,7 +151,8 @@ fn main() -> Result<()> {
     match command {
         Command::Info { image } => cmd_info(&image),
         Command::BootInfo { image, json } => cmd_boot_info(&image, json),
-        Command::Entries { image, json } => cmd_entries(&image, json),
+        Command::Entries { image, json, quick } => cmd_entries(&image, json, quick),
+        Command::Compat { image, json } => cmd_compat(&image, json),
         Command::Ls { image, path, part } => cmd_ls(&image, &path, part),
         Command::Cat { image, path, part } => cmd_cat(&image, &path, part),
         Command::Cp { image, source, dest, part, decompress } => {
@@ -338,7 +355,21 @@ fn cmd_boot_info(image: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_entries(image: &str, json: bool) -> Result<()> {
+/// `dma_restricted_pool`, memoised by kernel path within one partition's scan.
+/// A normal+recovery GRUB pair shares one kernel (hence one `config-<rel>`),
+/// so this reads the ~250 KB config once instead of per entry.
+fn dma_cached(
+    cache: &mut HashMap<String, Option<bool>>,
+    fs: &dyn FileSystem,
+    entry: &BootEntry,
+) -> Option<bool> {
+    let key = entry.kernel.clone().unwrap_or_default();
+    *cache
+        .entry(key)
+        .or_insert_with(|| lbx::boot::dma_restricted_pool(fs, entry))
+}
+
+fn cmd_entries(image: &str, json: bool, quick: bool) -> Result<()> {
     let disk = open_disk(image)?;
     let table = part::scan(disk.as_ref())?;
     let mut found = false;
@@ -350,15 +381,19 @@ fn cmd_entries(image: &str, json: bool) -> Result<()> {
             continue;
         }
         found = true;
+        let mut dma_cache = HashMap::new();
         if json {
             for (i, entry) in scan.entries.iter().enumerate() {
                 let fixed = fixed_cmdline(entry, &table);
+                let dma = dma_cached(&mut dma_cache, fs.as_ref(), entry);
                 json_items.push(entry_json(
                     p.index,
                     Some(i) == scan.default,
                     entry,
                     fixed.as_deref(),
                     fs.as_ref(),
+                    dma,
+                    quick,
                 ));
             }
             continue;
@@ -371,7 +406,7 @@ fn cmd_entries(image: &str, json: bool) -> Result<()> {
             if let Some(c) = kernel_compression(fs.as_ref(), entry) {
                 println!("      note: compressed kernel ({}); extract with --decompress for direct-kernel boot", c.label());
             }
-            if lbx::boot::dma_restricted_pool(fs.as_ref(), entry) == Some(false) {
+            if dma_cached(&mut dma_cache, fs.as_ref(), entry) == Some(false) {
                 println!("      note: kernel lacks CONFIG_DMA_RESTRICTED_POOL; virtio fails under a protected VM");
             }
         }
@@ -382,6 +417,29 @@ fn cmd_entries(image: &str, json: bool) -> Result<()> {
     }
     if !found {
         bail!("no boot entries found in any partition");
+    }
+    Ok(())
+}
+
+fn cmd_compat(image: &str, json: bool) -> Result<()> {
+    let disk = open_disk(image)?;
+    let compressed = disk.has_compressed_clusters()?;
+    if json {
+        println!(
+            "{{\"format\":{},\"compressed_clusters\":{}}}",
+            jstr(disk.format()),
+            compressed
+        );
+        return Ok(());
+    }
+    println!("format: {}", disk.format());
+    println!("compressed_clusters: {compressed}");
+    if compressed {
+        println!(
+            "note: zlib-compressed clusters — crosvm cannot read this image \
+             (guest sees I/O errors / no partition table); convert with \
+             `qemu-img convert` without --compress before a direct crosvm boot"
+        );
     }
     Ok(())
 }
@@ -585,28 +643,44 @@ fn entry_json(
     e: &BootEntry,
     fixed: Option<&str>,
     fs: &dyn FileSystem,
+    dma_restricted_pool: Option<bool>,
+    quick: bool,
 ) -> String {
-    // File sizes come from inode metadata only (no data read); a VMM
-    // caching extracted files keys on URI + size to skip re-extraction.
     let kernel = e
         .kernel
         .as_ref()
         .map(|k| jstr(&uri(part, k)))
         .unwrap_or_else(|| "null".into());
-    let kernel_size = jsize(e.kernel.as_ref().and_then(|k| fs.file_size(k).ok()));
+    // File sizes come from inode metadata only (no data read); a VMM
+    // caching extracted files keys on URI + size to skip re-extraction.
+    // `quick` (URL preview) skips them — a plain listing never uses them.
+    let kernel_size = if quick {
+        "null".into()
+    } else {
+        jsize(e.kernel.as_ref().and_then(|k| fs.file_size(k).ok()))
+    };
     let initrd: Vec<String> = e.initrd.iter().map(|i| jstr(&uri(part, i))).collect();
-    let initrd_size: Vec<String> =
-        e.initrd.iter().map(|i| jsize(fs.file_size(i).ok())).collect();
+    let initrd_size: Vec<String> = if quick {
+        e.initrd.iter().map(|_| "null".to_string()).collect()
+    } else {
+        e.initrd.iter().map(|i| jsize(fs.file_size(i).ok())).collect()
+    };
     // Whether this kernel can do virtio in a gunyah protected VM (needs
-    // CONFIG_DMA_RESTRICTED_POOL); null = could not determine.
-    let dma_restricted_pool = lbx::boot::dma_restricted_pool(fs, e)
+    // CONFIG_DMA_RESTRICTED_POOL); null = could not determine. Resolved by
+    // the caller (deduped per kernel) so it isn't re-read per entry.
+    let dma_restricted_pool = dma_restricted_pool
         .map(|b| b.to_string())
         .unwrap_or_else(|| "null".into());
     // Compression wrapping the kernel (gzip/zboot), so a direct-boot caller
-    // knows to extract it with `--decompress`; null = already raw.
-    let kernel_compression = kernel_compression(fs, e)
-        .map(|c| jstr(&c.label()))
-        .unwrap_or_else(|| "null".into());
+    // knows to extract it with `--decompress`; null = already raw. `quick`
+    // skips the prefix read (the URL preview doesn't direct-boot).
+    let kernel_compression = if quick {
+        "null".into()
+    } else {
+        kernel_compression(fs, e)
+            .map(|c| jstr(&c.label()))
+            .unwrap_or_else(|| "null".into())
+    };
     format!(
         "{{\"partition\":{part},\"default\":{is_default},\"source\":{},\"title\":{},\"version\":{},\"id\":{},\"kernel\":{kernel},\"kernel_size\":{kernel_size},\"initrd\":[{}],\"initrd_size\":[{}],\"cmdline\":{},\"cmdline_fixed\":{},\"dma_restricted_pool\":{dma_restricted_pool},\"kernel_compression\":{kernel_compression}}}",
         jstr(&e.source.to_string()),
@@ -627,7 +701,8 @@ fn boot_info_json(
     configs: &[String],
     fs: &dyn FileSystem,
 ) -> String {
-    let entry = entry_json(part, true, e, fixed, fs);
+    let dma = lbx::boot::dma_restricted_pool(fs, e);
+    let entry = entry_json(part, true, e, fixed, fs, dma, false);
     let configs: Vec<String> = configs.iter().map(|c| jstr(&uri(part, c))).collect();
     format!(
         "{{\"entry\":{entry},\"configs\":[{}]}}",

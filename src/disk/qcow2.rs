@@ -151,6 +151,32 @@ impl<D: ReadAt> Qcow2<D> {
         self.backing = Some(backing);
     }
 
+    /// Whether any allocated cluster is zlib-compressed. lbx reads such
+    /// clusters fine, but crosvm's qcow2 reader cannot — it returns I/O
+    /// errors to the guest, so the disk shows up with the right size yet no
+    /// readable partition table. A caller that direct-boots via crosvm uses
+    /// this to convert the image first. Scans only present L2 tables (one
+    /// whole-cluster read each) and returns at the first compressed entry —
+    /// a compressed cloud image hits cluster 0 immediately. The backing
+    /// chain is not scanned (imported images are single-file).
+    pub fn has_compressed_clusters(&self) -> Result<bool> {
+        let mut l2 = vec![0u8; self.cluster_size() as usize];
+        for &l1_entry in &self.l1 {
+            let l2_table = l1_entry & L1_OFFSET_MASK;
+            if l2_table == 0 {
+                continue; // L2 table not allocated -> no clusters here
+            }
+            self.host.read_at(l2_table, &mut l2)?;
+            for chunk in l2.chunks_exact(8) {
+                let entry = u64::from_be_bytes(chunk.try_into().unwrap());
+                if entry & L2_COMPRESSED != 0 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn cluster_size(&self) -> u64 {
         1 << self.cluster_bits
     }

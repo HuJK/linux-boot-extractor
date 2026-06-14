@@ -57,6 +57,16 @@ impl DiskImage {
             DiskImage::Qcow2(_) => "qcow2",
         }
     }
+
+    /// Whether the image stores any zlib-compressed cluster (qcow2 only;
+    /// always false for raw). crosvm cannot read compressed clusters, so a
+    /// caller direct-booting through crosvm uses this to convert first.
+    pub fn has_compressed_clusters(&self) -> Result<bool> {
+        match self {
+            DiskImage::Raw(_) => Ok(false),
+            DiskImage::Qcow2(q) => q.has_compressed_clusters(),
+        }
+    }
 }
 
 impl ReadAt for DiskImage {
