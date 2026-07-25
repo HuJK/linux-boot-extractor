@@ -7,9 +7,9 @@
 //! are the grubenv ones (`saved_entry`, `kernelopts`, `tuned_params`, …);
 //! unknown variables expand to empty.
 
-use super::{expand, BootEntry, Source};
-use crate::fsys::FileSystem;
+use super::{BootEntry, Source, expand};
 use crate::Result;
+use crate::fsys::FileSystem;
 use std::collections::BTreeMap;
 
 pub struct GrubScan {
@@ -28,6 +28,13 @@ struct RawEntry {
     sub: Option<usize>,
 }
 
+/// A `submenu` block, so a `default` path can name it by id or title.
+struct RawSubmenu {
+    top: usize,
+    id: Option<String>,
+    title: Option<String>,
+}
+
 pub fn parse(
     fs: &dyn FileSystem,
     cfg_path: &str,
@@ -39,6 +46,7 @@ pub fn parse(
 
 pub(crate) fn parse_str(text: &str, env: &BTreeMap<String, String>) -> GrubScan {
     let mut raw: Vec<RawEntry> = Vec::new();
+    let mut submenus: Vec<RawSubmenu> = Vec::new();
     let mut default_spec: Option<String> = None;
     let mut uses_bls = false;
 
@@ -101,13 +109,27 @@ pub(crate) fn parse_str(text: &str, env: &BTreeMap<String, String>) -> GrubScan 
                     current = Some((
                         depth,
                         RawEntry {
-                            entry: BootEntry { title, id, source: Source::Grub, ..Default::default() },
+                            entry: BootEntry {
+                                title,
+                                id,
+                                source: Source::Grub,
+                                ..Default::default()
+                            },
                             top,
                             sub,
                         },
                     ));
                 }
                 "submenu" if opens_block => {
+                    submenus.push(RawSubmenu {
+                        top: top_count,
+                        id: words
+                            .iter()
+                            .position(|w| w == "$menuentry_id_option")
+                            .and_then(|i| words.get(i + 1))
+                            .cloned(),
+                        title: words.get(1).cloned(),
+                    });
                     submenu = Some((depth, top_count, 0));
                     top_count += 1;
                 }
@@ -144,7 +166,7 @@ pub(crate) fn parse_str(text: &str, env: &BTreeMap<String, String>) -> GrubScan 
         raw.push(entry); // unterminated block: salvage what we parsed
     }
 
-    let default = resolve_default(&raw, default_spec.as_deref().unwrap_or("0"));
+    let default = resolve_default(&raw, &submenus, default_spec.as_deref().unwrap_or("0"));
     GrubScan {
         entries: raw.into_iter().map(|r| r.entry).collect(),
         default,
@@ -152,33 +174,98 @@ pub(crate) fn parse_str(text: &str, env: &BTreeMap<String, String>) -> GrubScan 
     }
 }
 
-/// Resolve a GRUB `default` spec: numeric index, `N>M` submenu path,
-/// entry id (`--id` / $menuentry_id_option), or entry title.
-fn resolve_default(entries: &[RawEntry], spec: &str) -> Option<usize> {
+/// Resolve a GRUB `default` spec: a numeric index, an entry id (`--id` /
+/// $menuentry_id_option), an entry title, or a `>`-separated path into a
+/// submenu whose components are any of those.
+///
+/// GRUB resolves a path one menu level at a time, so each component has to be
+/// matched within its own level -- `parentId>childId` is what grub-mkconfig
+/// writes for a GRUB_DEFAULT inside a submenu, and what grub-set-default /
+/// grub-reboot store. Matching the whole spec against a single entry id (as
+/// this used to) never hits, and the fallback then silently booted the first
+/// entry instead of the configured one.
+fn resolve_default(entries: &[RawEntry], submenus: &[RawSubmenu], spec: &str) -> Option<usize> {
     if entries.is_empty() {
         return None;
     }
     let spec = if spec.is_empty() { "0" } else { spec };
+    let comps: Vec<&str> = spec.split('>').map(str::trim).collect();
 
-    let parts: Vec<Option<usize>> =
-        spec.split('>').map(|p| p.trim().parse::<usize>().ok()).collect();
-    if parts.iter().all(Option::is_some) {
-        let top = parts[0].unwrap();
-        let sub = parts.get(1).and_then(|p| *p);
-        // Exact match first; a bare submenu index falls through to its
-        // first child (GRUB boots that when default points at a submenu).
-        return entries
+    // Any entry, at any level, by id then title. Used for a single-component
+    // spec, where GRUB accepts a plain id even for a nested entry.
+    let flat = |name: &str| {
+        entries
             .iter()
-            .position(|e| e.top == top && e.sub == sub)
+            .position(|e| e.entry.id.as_deref() == Some(name))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .position(|e| e.entry.title.as_deref() == Some(name))
+            })
+    };
+    // First entry of a top-level item: the item itself, or -- when it is a
+    // submenu -- its first child, which is what GRUB boots.
+    let first_of_top = |top: usize| {
+        entries
+            .iter()
+            .position(|e| e.top == top && e.sub.is_none())
             .or_else(|| entries.iter().position(|e| e.top == top))
-            .or(Some(0));
+    };
+
+    if comps.len() == 1 {
+        let head = comps[0];
+        return match head.parse::<usize>() {
+            Ok(top) => first_of_top(top),
+            Err(_) => flat(head).or_else(|| {
+                submenus
+                    .iter()
+                    .find(|s| s.id.as_deref() == Some(head) || s.title.as_deref() == Some(head))
+                    .and_then(|s| first_of_top(s.top))
+            }),
+        }
+        .or(Some(0));
     }
 
-    entries
-        .iter()
-        .position(|e| e.entry.id.as_deref() == Some(spec))
-        .or_else(|| entries.iter().position(|e| e.entry.title.as_deref() == Some(spec)))
-        .or(Some(0))
+    // Path: resolve the head to a top-level index, then the next component
+    // inside it. Deeper nesting is not modelled (entries carry one sub level),
+    // so anything beyond the second component falls back to the submenu.
+    let head = comps[0];
+    let top = match head.parse::<usize>() {
+        Ok(top) => Some(top),
+        Err(_) => entries
+            .iter()
+            .find(|e| {
+                e.sub.is_none()
+                    && (e.entry.id.as_deref() == Some(head)
+                        || e.entry.title.as_deref() == Some(head))
+            })
+            .map(|e| e.top)
+            .or_else(|| {
+                submenus
+                    .iter()
+                    .find(|s| s.id.as_deref() == Some(head) || s.title.as_deref() == Some(head))
+                    .map(|s| s.top)
+            }),
+    };
+    let Some(top) = top else {
+        // Unknown head: fall back to a flat match on the last component before
+        // giving up, so a stale path still has a chance of naming the entry.
+        return comps.last().and_then(|c| flat(c)).or(Some(0));
+    };
+
+    let child = comps[1];
+    match child.parse::<usize>() {
+        Ok(sub) => entries
+            .iter()
+            .position(|e| e.top == top && e.sub == Some(sub)),
+        Err(_) => entries.iter().position(|e| {
+            e.top == top
+                && e.sub.is_some()
+                && (e.entry.id.as_deref() == Some(child) || e.entry.title.as_deref() == Some(child))
+        }),
+    }
+    .or_else(|| first_of_top(top))
+    .or(Some(0))
 }
 
 /// Strip a `(hd0,gpt2)` / `($root)` device prefix and force `/`-absolute.
@@ -188,7 +275,11 @@ fn clean_path(p: &str) -> String {
     } else {
         p
     };
-    if p.starts_with('/') { p.to_string() } else { format!("/{p}") }
+    if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("/{p}")
+    }
 }
 
 /// Shell-ish word split honoring single/double quotes (quotes stripped).
@@ -258,7 +349,10 @@ submenu 'Advanced options for Ubuntu' $menuentry_id_option 'gnulinux-advanced-uu
             scan.entries[0].cmdline.as_deref(),
             Some("root=UUID=uuid1 ro console=ttyS0")
         );
-        assert_eq!(scan.entries[0].initrd, vec!["/boot/initrd.img-5.15.0-105-generic"]);
+        assert_eq!(
+            scan.entries[0].initrd,
+            vec!["/boot/initrd.img-5.15.0-105-generic"]
+        );
         // saved_entry unset -> "" -> "0" -> first top-level entry
         assert_eq!(scan.default, Some(0));
     }
@@ -273,6 +367,57 @@ submenu 'Advanced options for Ubuntu' $menuentry_id_option 'gnulinux-advanced-uu
             scan.entries[2].kernel.as_deref(),
             Some("/boot/vmlinuz-5.15.0-91-generic")
         );
+    }
+
+    #[test]
+    fn saved_entry_picks_submenu_child_by_id_path() {
+        // What grub-mkconfig writes when GRUB_DEFAULT names an entry inside a
+        // submenu (and what grub-set-default/grub-reboot store): the components
+        // are ids, not indices. GRUB resolves them one menu level at a time.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "saved_entry".to_string(),
+            "gnulinux-advanced-uuid1>gnulinux-5.15.0-91-generic-advanced-uuid1".to_string(),
+        );
+        let scan = parse_str(UBUNTU_STYLE, &env);
+        assert_eq!(scan.default, Some(2));
+        assert_eq!(
+            scan.entries[2].kernel.as_deref(),
+            Some("/boot/vmlinuz-5.15.0-91-generic")
+        );
+    }
+
+    #[test]
+    fn saved_entry_id_path_by_title() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "saved_entry".to_string(),
+            "Advanced options for Ubuntu>Ubuntu, with Linux 5.15.0-105-generic".to_string(),
+        );
+        let scan = parse_str(UBUNTU_STYLE, &env);
+        assert_eq!(scan.default, Some(1));
+    }
+
+    #[test]
+    fn saved_entry_submenu_alone_falls_through_to_first_child() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "saved_entry".to_string(),
+            "gnulinux-advanced-uuid1".to_string(),
+        );
+        let scan = parse_str(UBUNTU_STYLE, &env);
+        assert_eq!(scan.default, Some(1));
+    }
+
+    #[test]
+    fn saved_entry_mixed_id_and_index_path() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "saved_entry".to_string(),
+            "gnulinux-advanced-uuid1>1".to_string(),
+        );
+        let scan = parse_str(UBUNTU_STYLE, &env);
+        assert_eq!(scan.default, Some(2));
     }
 
     #[test]
@@ -301,6 +446,9 @@ blscfg
         let cfg = "menuentry 'F' {\n  linux ($root)/vmlinuz-6.6 $kernelopts quiet\n}\n";
         let scan = parse_str(cfg, &env);
         assert_eq!(scan.entries[0].kernel.as_deref(), Some("/vmlinuz-6.6"));
-        assert_eq!(scan.entries[0].cmdline.as_deref(), Some("root=UUID=x ro quiet"));
+        assert_eq!(
+            scan.entries[0].cmdline.as_deref(),
+            Some("root=UUID=x ro quiet")
+        );
     }
 }
