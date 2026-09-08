@@ -31,6 +31,9 @@ pub enum Source {
     Extlinux,
     #[default]
     Fallback,
+    /// Not declared by any config: [`crate::guest`] found the install
+    /// itself (a Windows boot manager on the ESP).
+    Windows,
 }
 
 impl std::fmt::Display for Source {
@@ -40,8 +43,64 @@ impl std::fmt::Display for Source {
             Source::Bls => "bls",
             Source::Extlinux => "extlinux",
             Source::Fallback => "fallback",
+            Source::Windows => "windows",
         })
     }
+}
+
+/// What a VMM has to do to start an entry. `source` says where we learned
+/// about the entry; this says what booting it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EntryKind {
+    /// Kernel + initramfs: load them and jump (direct-kernel boot).
+    #[default]
+    Linux,
+    /// A Windows install: no kernel exists: run firmware and let its boot
+    /// manager take over, with the image attached as a plain disk.
+    Windows,
+}
+
+impl std::fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EntryKind::Linux => "linux",
+            EntryKind::Windows => "windows",
+        })
+    }
+}
+
+/// The firmware an entry starts from, when it isn't direct-kernel booted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Firmware {
+    /// A boot manager on the ESP: run the image under UEFI firmware.
+    Uefi,
+    /// MBR/VBR boot code: needs a legacy BIOS (a VMM with no CSM can't).
+    Bios,
+    /// Both paths are present (a UEFI install that kept its MBR bootstrap).
+    Both,
+}
+
+impl std::fmt::Display for Firmware {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Firmware::Uefi => "uefi",
+            Firmware::Bios => "bios",
+            Firmware::Both => "uefi+bios",
+        })
+    }
+}
+
+/// What starting a Windows entry takes, in place of a kernel.
+#[derive(Debug, Clone)]
+pub struct WindowsBoot {
+    pub firmware: Firmware,
+    /// Architecture from the boot manager's PE header (`x86_64`,
+    /// `aarch64`, ...), i.e. which firmware build the VMM needs. `None`
+    /// for a BIOS install, whose loader sits on unreadable NTFS.
+    pub arch: Option<&'static str>,
+    /// The boot manager, as a `pN:/path` URI — unlike `kernel`/`initrd`
+    /// it may live on a different partition than the config that names it.
+    pub loader: Option<String>,
 }
 
 /// One bootable configuration, resolved as far as we can.
@@ -58,6 +117,22 @@ pub struct BootEntry {
     pub cmdline: Option<String>,
     pub version: Option<String>,
     pub source: Source,
+    /// Set when this entry boots Windows rather than a kernel; `kernel`
+    /// and `initrd` are then empty. [`BootEntry::kind`] reads it.
+    pub windows: Option<WindowsBoot>,
+    /// A config's `chainloader` target, verbatim (an EFI binary path).
+    /// Such an entry hands control to another boot manager instead of
+    /// loading a kernel; [`crate::guest`] resolves what it points at.
+    pub chainloader: Option<String>,
+}
+
+impl BootEntry {
+    pub fn kind(&self) -> EntryKind {
+        match self.windows {
+            Some(_) => EntryKind::Windows,
+            None => EntryKind::Linux,
+        }
+    }
 }
 
 /// Everything we found on one filesystem.
@@ -189,6 +264,26 @@ fn loader_conf_default(fs: &dyn FileSystem, configs: &mut Vec<String>) -> Option
     None
 }
 
+/// Keep the entries `keep` marks, moving `default` to wherever the entry
+/// it pointed at ended up (or to the first survivor when that entry is
+/// gone). The one place entry indices are renumbered.
+pub(crate) fn retain(
+    entries: Vec<BootEntry>,
+    default: Option<usize>,
+    keep: &[bool],
+) -> (Vec<BootEntry>, Option<usize>) {
+    let new_default = default
+        .map(|d| keep[..d].iter().filter(|&&k| k).count())
+        .filter(|_| default.is_some_and(|d| keep[d]));
+    let kept: Vec<BootEntry> = entries
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(e, &k)| k.then_some(e))
+        .collect();
+    let new_default = if kept.is_empty() { None } else { new_default.or(Some(0)) };
+    (kept, new_default)
+}
+
 /// Configs can reference kernels that were since removed. Drop entries
 /// whose kernel file is missing — unless that would drop everything, in
 /// which case keep the originals (better a stale answer than none).
@@ -204,20 +299,19 @@ fn drop_stale_entries(
     // at the rootfs). Such a partition then no longer masquerades as bootable
     // and beat the one holding the real kernel. (Transient remote-read blips
     // are absorbed by the HTTP layer's retries.)
+    //
+    // A `chainloader` entry has no kernel by definition — it starts
+    // another boot manager (a dual-boot menu's Windows item). Keep it:
+    // `guest` resolves the target, and dropping it here would silently
+    // move the default off what the bootloader actually boots.
     let keep: Vec<bool> = entries
         .iter()
-        .map(|e| e.kernel.as_deref().is_some_and(|k| fs.exists(k)))
+        .map(|e| {
+            e.chainloader.is_some()
+                || e.kernel.as_deref().is_some_and(|k| fs.exists(k))
+        })
         .collect();
-    let new_default = default
-        .map(|d| keep[..d].iter().filter(|&&k| k).count())
-        .filter(|_| default.is_some_and(|d| keep[d]));
-    let kept: Vec<BootEntry> = entries
-        .into_iter()
-        .zip(&keep)
-        .filter_map(|(e, &k)| k.then_some(e))
-        .collect();
-    let new_default = if kept.is_empty() { None } else { new_default.or(Some(0)) };
-    (kept, new_default)
+    retain(entries, default, &keep)
 }
 
 /// Kernel releases this entry could map to, most-specific first: the
@@ -380,7 +474,7 @@ fn fallback_scan(fs: &dyn FileSystem) -> Result<(Vec<BootEntry>, Option<usize>)>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::fsys::DirEntry;
     use std::collections::BTreeMap;
@@ -498,6 +592,31 @@ mod tests {
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].kernel.as_deref(), Some("/boot/vmlinuz-new"));
         assert_eq!(scan.default, Some(0));
+    }
+
+    #[test]
+    fn chainloader_entries_survive_the_stale_sweep() {
+        // A chainloader item has no kernel by definition; dropping it would
+        // move the default onto an entry GRUB would not have booted.
+        let fs = MockFs::new([
+            (
+                "/boot/grub/grub.cfg",
+                "set default=\"1\"\nmenuentry 'Debian' {\n linux /boot/vmlinuz-6.6.9\n}\nmenuentry 'Windows Boot Manager' {\n chainloader /EFI/Microsoft/Boot/bootmgfw.efi\n}\nmenuentry 'UEFI Firmware Settings' {\n fwsetup\n}\n",
+            ),
+            ("/boot/vmlinuz-6.6.9", "k"),
+        ]);
+        let scan = scan(&fs).unwrap();
+        // The kernel-less firmware-settings stub still goes.
+        assert_eq!(scan.entries.len(), 2);
+        assert_eq!(scan.default, Some(1));
+        let win = &scan.entries[1];
+        assert_eq!(win.kernel, None);
+        assert_eq!(
+            win.chainloader.as_deref(),
+            Some("/EFI/Microsoft/Boot/bootmgfw.efi")
+        );
+        // `guest` decides what it points at; `boot` only records it.
+        assert_eq!(win.kind(), EntryKind::Linux);
     }
 
     #[test]

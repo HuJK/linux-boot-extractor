@@ -95,6 +95,7 @@ mod tests {
                     start_byte: 0,
                     size_bytes: 0,
                     kind: "Linux filesystem".into(),
+                    type_id: String::new(),
                     name: None,
                     probe_worthy: true,
                     part_uuid: uuid.map(str::to_string),

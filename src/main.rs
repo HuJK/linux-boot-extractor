@@ -1,11 +1,12 @@
 mod shell;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use lbx::blockdev::ReadAt;
 use lbx::boot::{BootEntry, BootScan, Source};
 use lbx::disk::DiskImage;
 use lbx::fsys::{self, DirEntry, FileKind, FileSystem};
+use lbx::guest::PartitionBoot;
 use lbx::part::{self, Partition};
 use std::collections::HashMap;
 use std::io::Write;
@@ -166,7 +167,7 @@ fn main() -> Result<()> {
         }
         Command::Shell { image } => {
             let disk = open_disk(&image)?;
-            shell::run(open_filesystems(&disk, None)?)
+            shell::run(require_filesystems(&disk, None)?)
         }
     }
 }
@@ -195,6 +196,9 @@ fn open_disk(image: &str) -> Result<Arc<DiskImage>> {
 }
 
 /// (partition, filesystem) pairs for every partition we can actually read.
+/// An image with nothing readable (a Windows guest: NTFS everywhere)
+/// yields an empty list — the boot scanners turn that into a verdict of
+/// their own; callers that must read a file use [`require_filesystems`].
 fn open_filesystems(
     disk: &Arc<DiskImage>,
     only_part: Option<usize>,
@@ -219,6 +223,16 @@ fn open_filesystems(
             }
         }
     }
+    Ok(out)
+}
+
+/// [`open_filesystems`] for the commands that exist to read a file: with
+/// no readable filesystem there is nothing to say but so.
+fn require_filesystems(
+    disk: &Arc<DiskImage>,
+    only_part: Option<usize>,
+) -> Result<Vec<(Partition, Box<dyn FileSystem>)>> {
+    let out = open_filesystems(disk, only_part)?;
     if out.is_empty() {
         bail!(
             "no readable filesystem found{}",
@@ -228,28 +242,49 @@ fn open_filesystems(
     Ok(out)
 }
 
-type PartScan = (Partition, Box<dyn FileSystem>, BootScan);
-
 /// The partition whose boot entries we trust most: config-derived entries
 /// (they carry the cmdline) beat fallback directory scans.
-fn best_boot_scan(disk: &Arc<DiskImage>) -> Result<Option<PartScan>> {
+fn best_boot_scan(disk: &Arc<DiskImage>) -> Result<Option<PartitionBoot>> {
     let has_config =
         |s: &BootScan| s.entries.iter().any(|e| e.source != Source::Fallback);
-    let mut best: Option<PartScan> = None;
-    for (p, fs) in open_filesystems(disk, None)? {
-        let scan = lbx::boot::scan(fs.as_ref())?;
-        if scan.entries.is_empty() {
-            continue;
-        }
+    let mut best: Option<PartitionBoot> = None;
+    for pb in lbx::guest::bootable(disk)? {
         let better = match &best {
             None => true,
-            Some((_, _, b)) => has_config(&scan) && !has_config(b),
+            Some(b) => has_config(&pb.scan) && !has_config(&b.scan),
         };
         if better {
-            best = Some((p, fs, scan));
+            best = Some(pb);
         }
     }
     Ok(best)
+}
+
+/// The error for an image that boots nothing we can use. Windows volumes
+/// are the common reason and the caller can act on knowing that, so say
+/// what was seen instead of leaving them with "not found".
+fn no_boot_artifacts(disk: &Arc<DiskImage>) -> anyhow::Error {
+    let Ok(Some(w)) = lbx::guest::windows(disk) else {
+        return anyhow!("no boot artifacts (kernel/initramfs) found in any partition");
+    };
+    let evidence = w.evidence.join("; ");
+    match w.firmware {
+        // Windows files but no boot path: an attached data disk.
+        None => anyhow!(
+            "nothing to boot: Windows volumes but no boot manager, so this \
+             looks like a data disk rather than a bootable image ({evidence})"
+        ),
+        Some(f) => anyhow!(
+            "nothing to direct-kernel boot: this is a Windows guest ({}) — \
+             run the image under {} firmware with the disk attached as-is \
+             ({evidence})",
+            w.summary(),
+            match f {
+                lbx::boot::Firmware::Bios => "legacy BIOS",
+                _ => "UEFI",
+            }
+        ),
+    }
 }
 
 fn cmd_info(image: &str) -> Result<()> {
@@ -276,6 +311,16 @@ fn cmd_info(image: &str) -> Result<()> {
 }
 
 pub(crate) fn print_entry(part: usize, entry: &BootEntry, fixed: Option<&str>) {
+    // A Windows entry starts firmware, not a kernel: what it needs is the
+    // firmware kind, the architecture to run it as, and its boot manager.
+    if let Some(w) = &entry.windows {
+        println!("      firmware: {}", w.firmware);
+        println!("      arch:     {}", w.arch.unwrap_or("-"));
+        if let Some(loader) = &w.loader {
+            println!("      loader:   {loader}");
+        }
+        return;
+    }
     if let Some(kernel) = &entry.kernel {
         println!("      kernel:  {}", uri(part, kernel));
     }
@@ -318,27 +363,51 @@ fn kernel_compression(fs: &dyn FileSystem, entry: &BootEntry) -> Option<lbx::ker
 
 fn cmd_boot_info(image: &str, json: bool) -> Result<()> {
     let disk = open_disk(image)?;
-    let Some((p, fs, scan)) = best_boot_scan(&disk)? else {
-        bail!("no boot artifacts (kernel/initramfs) found in any partition");
+    let Some(pb) = best_boot_scan(&disk)? else {
+        return Err(no_boot_artifacts(&disk));
     };
-    let index = scan.default.unwrap_or(0);
-    let entry = &scan.entries[index];
+    let (part, fs) = (pb.partition.index, pb.fs.as_deref());
+    let index = pb.scan.default.unwrap_or(0);
+    let entry = &pb.scan.entries[index];
     let table = part::scan(disk.as_ref())?;
     let fixed = fixed_cmdline(entry, &table);
 
     if json {
         println!(
             "{}",
-            boot_info_json(p.index, entry, fixed.as_deref(), &scan.configs, fs.as_ref())
+            boot_info_json(part, entry, fixed.as_deref(), &pb.scan.configs, fs)
+        );
+        return Ok(());
+    }
+    // What the bootloader would boot may be the Windows install, not a
+    // kernel — on a dual-boot image that is exactly what `set default`
+    // says. Report it as it is instead of failing to find a kernel.
+    if let Some(w) = &entry.windows {
+        println!("type:     {}", entry.kind());
+        println!("title:    {}", entry_label(entry));
+        println!("firmware: {}", w.firmware);
+        println!("arch:     {}", w.arch.unwrap_or("-"));
+        if let Some(loader) = &w.loader {
+            println!("loader:   {loader}");
+        }
+        println!("source:   {}", entry.source);
+        println!(
+            "note: nothing to direct-kernel boot here; run the image under \
+             {} firmware with the disk attached as-is",
+            match w.firmware {
+                lbx::boot::Firmware::Bios => "legacy BIOS",
+                _ => "UEFI",
+            }
         );
         return Ok(());
     }
     let Some(kernel) = &entry.kernel else {
         bail!("default entry has no kernel path");
     };
-    println!("kernel:  {}", uri(p.index, kernel));
+    println!("type:    {}", entry.kind());
+    println!("kernel:  {}", uri(part, kernel));
     for initrd in &entry.initrd {
-        println!("initrd:  {}", uri(p.index, initrd));
+        println!("initrd:  {}", uri(part, initrd));
     }
     if let Some(cmdline) = &entry.cmdline {
         println!("cmdline: {cmdline}");
@@ -348,7 +417,7 @@ fn cmd_boot_info(image: &str, json: bool) -> Result<()> {
     } else {
         println!("cmdline: (unknown — entry came from {} scan)", entry.source);
     }
-    if let Some(c) = kernel_compression(fs.as_ref(), entry) {
+    if let Some(c) = fs.and_then(|fs| kernel_compression(fs, entry)) {
         println!("compression: {} (extract with --decompress for direct-kernel boot)", c.label());
     }
     println!("source:  {}", entry.source);
@@ -375,38 +444,36 @@ fn cmd_entries(image: &str, json: bool, quick: bool) -> Result<()> {
     let mut found = false;
     let mut json_items: Vec<String> = Vec::new();
 
-    for (p, fs) in open_filesystems(&disk, None)? {
-        let scan = lbx::boot::scan(fs.as_ref())?;
-        if scan.entries.is_empty() {
-            continue;
-        }
+    for pb in lbx::guest::bootable(&disk)? {
+        let (index, scan, fs) = (pb.partition.index, &pb.scan, pb.fs.as_deref());
         found = true;
         let mut dma_cache = HashMap::new();
         if json {
             for (i, entry) in scan.entries.iter().enumerate() {
                 let fixed = fixed_cmdline(entry, &table);
-                let dma = dma_cached(&mut dma_cache, fs.as_ref(), entry);
+                let dma = fs.and_then(|fs| dma_cached(&mut dma_cache, fs, entry));
                 json_items.push(entry_json(
-                    p.index,
+                    index,
                     Some(i) == scan.default,
                     entry,
                     fixed.as_deref(),
-                    fs.as_ref(),
+                    fs,
                     dma,
                     quick,
                 ));
             }
             continue;
         }
-        println!("partition {} ({}):", p.index, fs.fs_type());
+        println!("partition {} ({}):", index, pb.fs_type);
         for (i, entry) in scan.entries.iter().enumerate() {
             let mark = if Some(i) == scan.default { "*" } else { " " };
             println!("{mark} [{}] {} ({})", i + 1, entry_label(entry), entry.source);
-            print_entry(p.index, entry, fixed_cmdline(entry, &table).as_deref());
-            if let Some(c) = kernel_compression(fs.as_ref(), entry) {
+            print_entry(index, entry, fixed_cmdline(entry, &table).as_deref());
+            let Some(fs) = fs else { continue };
+            if let Some(c) = kernel_compression(fs, entry) {
                 println!("      note: compressed kernel ({}); extract with --decompress for direct-kernel boot", c.label());
             }
-            if dma_cached(&mut dma_cache, fs.as_ref(), entry) == Some(false) {
+            if dma_cached(&mut dma_cache, fs, entry) == Some(false) {
                 println!("      note: kernel lacks CONFIG_DMA_RESTRICTED_POOL; virtio fails under a protected VM");
             }
         }
@@ -416,7 +483,7 @@ fn cmd_entries(image: &str, json: bool, quick: bool) -> Result<()> {
         return Ok(());
     }
     if !found {
-        bail!("no boot entries found in any partition");
+        return Err(no_boot_artifacts(&disk));
     }
     Ok(())
 }
@@ -448,7 +515,7 @@ fn cmd_ls(image: &str, path: &str, part: Option<usize>) -> Result<()> {
     let disk = open_disk(image)?;
     let (uri_part, path) = parse_uri(path);
     let part = uri_part.or(part);
-    for (p, fs) in open_filesystems(&disk, part)? {
+    for (p, fs) in require_filesystems(&disk, part)? {
         let Ok(entries) = fs.read_dir(&path) else {
             continue;
         };
@@ -483,7 +550,7 @@ fn read_by_uri(
 ) -> Result<Vec<u8>> {
     let (uri_part, path) = parse_uri(path);
     let part = uri_part.or(part);
-    for (_, fs) in open_filesystems(disk, part)? {
+    for (_, fs) in require_filesystems(disk, part)? {
         if let Ok(data) = fs.read_file(&path) {
             return Ok(data);
         }
@@ -551,9 +618,10 @@ fn cmd_extract(
     decompress: bool,
 ) -> Result<()> {
     let disk = open_disk(image)?;
-    let Some((p, fs, scan)) = best_boot_scan(&disk)? else {
-        bail!("no boot artifacts (kernel/initramfs) found in any partition");
+    let Some(pb) = best_boot_scan(&disk)? else {
+        return Err(no_boot_artifacts(&disk));
     };
+    let (p, scan) = (&pb.partition, &pb.scan);
 
     let index = match entry_arg {
         Some(n) if n >= 1 && n <= scan.entries.len() => n - 1,
@@ -561,13 +629,25 @@ fn cmd_extract(
         None => scan.default.unwrap_or(0),
     };
     let entry = &scan.entries[index];
+    if let Some(w) = &entry.windows {
+        bail!(
+            "entry {} is a Windows install ({}), not a kernel — there is \
+             nothing to extract; run the image under firmware, or pick a \
+             Linux entry with --entry N (`lbx entries` lists them)",
+            index + 1,
+            w.firmware
+        );
+    }
+    let Some(fs) = pb.fs.as_deref() else {
+        bail!("partition {} has no readable filesystem", p.index);
+    };
     let Some(kernel) = &entry.kernel else {
         bail!("selected entry has no kernel path");
     };
     let table = part::scan(disk.as_ref())?;
     let fixed = fixed_cmdline(entry, &table);
 
-    println!("partition {} ({}), entry {} ({}):", p.index, fs.fs_type(), index + 1, entry.source);
+    println!("partition {} ({}), entry {} ({}):", p.index, pb.fs_type, index + 1, entry.source);
     print_entry(p.index, entry, fixed.as_deref());
     for cfg in &scan.configs {
         println!("      config:  {}", uri(p.index, cfg));
@@ -642,7 +722,9 @@ fn entry_json(
     is_default: bool,
     e: &BootEntry,
     fixed: Option<&str>,
-    fs: &dyn FileSystem,
+    // `None` for a partition we can only sniff (a Windows entry on NTFS):
+    // every per-entry file probe below is then skipped.
+    fs: Option<&dyn FileSystem>,
     dma_restricted_pool: Option<bool>,
     quick: bool,
 ) -> String {
@@ -654,16 +736,14 @@ fn entry_json(
     // File sizes come from inode metadata only (no data read); a VMM
     // caching extracted files keys on URI + size to skip re-extraction.
     // `quick` (URL preview) skips them — a plain listing never uses them.
-    let kernel_size = if quick {
-        "null".into()
-    } else {
-        jsize(e.kernel.as_ref().and_then(|k| fs.file_size(k).ok()))
+    let kernel_size = match fs {
+        Some(fs) if !quick => jsize(e.kernel.as_ref().and_then(|k| fs.file_size(k).ok())),
+        _ => "null".into(),
     };
     let initrd: Vec<String> = e.initrd.iter().map(|i| jstr(&uri(part, i))).collect();
-    let initrd_size: Vec<String> = if quick {
-        e.initrd.iter().map(|_| "null".to_string()).collect()
-    } else {
-        e.initrd.iter().map(|i| jsize(fs.file_size(i).ok())).collect()
+    let initrd_size: Vec<String> = match fs {
+        Some(fs) if !quick => e.initrd.iter().map(|i| jsize(fs.file_size(i).ok())).collect(),
+        _ => e.initrd.iter().map(|_| "null".to_string()).collect(),
     };
     // Whether this kernel can do virtio in a gunyah protected VM (needs
     // CONFIG_DMA_RESTRICTED_POOL); null = could not determine. Resolved by
@@ -674,15 +754,25 @@ fn entry_json(
     // Compression wrapping the kernel (gzip/zboot), so a direct-boot caller
     // knows to extract it with `--decompress`; null = already raw. `quick`
     // skips the prefix read (the URL preview doesn't direct-boot).
-    let kernel_compression = if quick {
-        "null".into()
-    } else {
-        kernel_compression(fs, e)
+    let kernel_compression = match fs {
+        Some(fs) if !quick => kernel_compression(fs, e)
             .map(|c| jstr(&c.label()))
-            .unwrap_or_else(|| "null".into())
+            .unwrap_or_else(|| "null".into()),
+        _ => "null".into(),
+    };
+    // Windows entries: what starting this one takes, in place of a kernel.
+    // Null on a Linux entry, as `kernel`/`cmdline` are null on a Windows one.
+    let (firmware, arch, loader) = match &e.windows {
+        Some(w) => (
+            jstr(&w.firmware.to_string()),
+            w.arch.map(jstr).unwrap_or_else(|| "null".into()),
+            jopt(&w.loader),
+        ),
+        None => ("null".into(), "null".into(), "null".into()),
     };
     format!(
-        "{{\"partition\":{part},\"default\":{is_default},\"source\":{},\"title\":{},\"version\":{},\"id\":{},\"kernel\":{kernel},\"kernel_size\":{kernel_size},\"initrd\":[{}],\"initrd_size\":[{}],\"cmdline\":{},\"cmdline_fixed\":{},\"dma_restricted_pool\":{dma_restricted_pool},\"kernel_compression\":{kernel_compression}}}",
+        "{{\"partition\":{part},\"default\":{is_default},\"type\":{},\"source\":{},\"title\":{},\"version\":{},\"id\":{},\"kernel\":{kernel},\"kernel_size\":{kernel_size},\"initrd\":[{}],\"initrd_size\":[{}],\"cmdline\":{},\"cmdline_fixed\":{},\"dma_restricted_pool\":{dma_restricted_pool},\"kernel_compression\":{kernel_compression},\"firmware\":{firmware},\"arch\":{arch},\"loader\":{loader}}}",
+        jstr(&e.kind().to_string()),
         jstr(&e.source.to_string()),
         jopt(&e.title),
         jopt(&e.version),
@@ -699,9 +789,9 @@ fn boot_info_json(
     e: &BootEntry,
     fixed: Option<&str>,
     configs: &[String],
-    fs: &dyn FileSystem,
+    fs: Option<&dyn FileSystem>,
 ) -> String {
-    let dma = lbx::boot::dma_restricted_pool(fs, e);
+    let dma = fs.and_then(|fs| lbx::boot::dma_restricted_pool(fs, e));
     let entry = entry_json(part, true, e, fixed, fs, dma, false);
     let configs: Vec<String> = configs.iter().map(|c| jstr(&uri(part, c))).collect();
     format!(

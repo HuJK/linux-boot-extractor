@@ -20,6 +20,7 @@ pub mod boot;
 pub mod disk;
 pub mod error;
 pub mod fsys;
+pub mod guest;
 pub mod kernel;
 pub mod part;
 pub mod source;

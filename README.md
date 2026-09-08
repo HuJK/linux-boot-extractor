@@ -25,6 +25,7 @@ source:  grub
 $ lbx boot-info disk.qcow2 --json   # same, machine-readable (for the VMM)
 
 $ lbx entries disk.qcow2 [--json]   # ALL boot entries, '*' marks default
+                                    #   (incl. Windows — see below)
 $ lbx info    disk.qcow2            # image format + partition table + fs types
 
 $ lbx ls  disk.qcow2 p2:/boot       # list files
@@ -75,6 +76,8 @@ kernel/initrd directly into guest memory, no temp files.
 | FAT12/16/32 (ESP) | [`fatfs`](https://crates.io/crates/fatfs) | done |
 | XFS | — | planned (RHEL 9 `/boot` default); detected with a clear error today |
 | btrfs / squashfs | — | detected with a clear error |
+| NTFS / exFAT / ReFS | — | detected only, deliberately: nothing a direct boot needs is on them, but naming them identifies a [Windows guest](#windows-guests) |
+| Windows entries | own code (`guest.rs`) | done: ESP boot manager (+ its PE arch), `chainloader` menu items, Microsoft partition types, NTFS/ReFS volumes, MBR/VBR boot code |
 | grub.cfg parser | `boot/grub.rs` | done: menuentry/submenu, linux*/initrd* variants, `set default` + grubenv `saved_entry` (index, `N>M`, id, title), `blscfg` redirect |
 | BLS (`/loader/entries`) | `boot/bls.rs` | done: version sort, `$kernelopts`/`$tuned_params` from grubenv, loader.conf `default` glob, boot-counting suffixes |
 | extlinux/syslinux | `boot/extlinux.rs` | done: `DEFAULT` label, `initrd=` lifted out of `APPEND` |
@@ -92,6 +95,10 @@ We only need to read `/boot` and the ESP, not the root filesystem:
 - **btrfs** — openSUSE keeps `/boot` in a btrfs subvolume. Later.
 - **LVM/LUKS** — `/boot` is essentially never on LVM, and encrypted images
   can't be read without keys. Out of scope for now.
+- **NTFS/exFAT/ReFS** — a Windows guest is direct-kernel-booted by nobody,
+  so there is nothing on them to extract. They are *detected* (never read)
+  because that is what tells a Windows image apart from a broken Linux one
+  — see below.
 
 ## Multi-kernel images
 
@@ -111,6 +118,67 @@ which the kernel resolves even without an initramfs. JSON output carries
 the rewrite as `cmdline_fixed` (null when nothing applies); `extract
 --vdafix` writes the fixed cmdline. Whole-disk `root=/dev/sda` and
 multi-disk installs can't be mapped and are left untouched.
+
+## Windows guests
+
+Not every image is Linux, and a VM manager needs to know before it goes
+looking for a kernel: a Windows guest has none, and can only be started the
+other way — as a plain disk under UEFI firmware (edk2/OVMF). So Windows is
+not a separate question with a separate command; it is simply another
+**boot entry**, listed by `entries`/`boot-info` alongside the Linux ones,
+carrying what starting it takes in place of a kernel:
+
+```console
+$ lbx entries win11.qcow2
+partition 1 (vfat):
+* [1] Windows Boot Manager (windows)
+      firmware: uefi
+      arch:     x86_64
+      loader:   p1:/EFI/Microsoft/Boot/bootmgfw.efi
+
+$ lbx entries dualboot.qcow2 --json
+[{… "type":"linux",   "kernel":"p5:/vmlinuz-6.6.9", "cmdline":"root=…",
+     "firmware":null, "arch":null, "loader":null},
+ {… "type":"windows", "kernel":null, "cmdline":null, "default":true,
+     "firmware":"uefi","arch":"x86_64",
+     "loader":"p1:/EFI/Microsoft/Boot/bootmgfw.efi"}]
+```
+
+`type` is the field to switch on: a `linux` entry is direct-kernel booted
+from `kernel`/`initrd`/`cmdline` as before, a `windows` entry needs
+`firmware` (`uefi`/`bios`) and `arch` (which firmware build) instead, and
+those fields are null on the kind they don't apply to. Everything else —
+`partition`, `default`, `source`, `title`, `id` — means the same for both.
+
+A Windows entry comes from one of two places:
+
+- a **`chainloader` menu item** in an existing config. os-prober writes one
+  per foreign OS, so a dual-boot GRUB menu already declares Windows and
+  says whether it is the default; the target is resolved against the boot
+  manager actually on the ESP. (Such kernel-less items used to be dropped,
+  which silently moved the default onto a Linux entry GRUB would *not*
+  have booted.)
+- **detection**, when nothing declares it — the usual Windows-only image.
+  Windows keeps its system files on NTFS, which we don't read, so this
+  works from what is readable anyway:
+  - the **ESP** is FAT: `/EFI/Microsoft/Boot/bootmgfw.efi` is the Windows
+    boot manager and settles it. Its PE header's machine field gives the
+    guest's architecture;
+  - **partition types** only Windows creates: Microsoft Reserved, Windows
+    recovery, LDM, Storage Spaces ("basic data" is deliberately not one of
+    them — it is the generic "holds a filesystem" type);
+  - **filesystem magic**: an NTFS or ReFS volume;
+  - **boot code**, for BIOS installs: Windows' own MBR bootstrap chaining
+    to an NTFS volume boot record that loads `BOOTMGR`/`NTLDR`. Either half
+    alone is too weak — the bootstrap outlives an OS replacement, and that
+    VBR code ships on *every* Windows-formatted volume — so both are
+    required.
+
+Windows volumes with **no** boot path at all are a data disk, not a guest:
+they produce no entry, and the "nothing to boot" error says so, with the
+evidence, rather than reporting a bootable Windows that isn't there.
+`extract` refuses a Windows entry (there is no kernel to write) and points
+at `--entry N` for the Linux ones.
 
 ## Compressed kernels (direct-kernel boot)
 
@@ -198,6 +266,17 @@ extract from the compressed image takes ~0.6 s.
 
 ```console
 $ cargo run -- extract /tmp/lbxtest/disk.qcow2 -o /tmp/lbxtest/out
+```
+
+`scripts/make-windows-test-image.sh [dir]` (needs `mkntfs` as well) builds
+three Windows layouts for the entries above — GPT/UEFI with an ESP boot
+manager, MBR/BIOS with Windows boot code, and a GRUB dual-boot menu whose
+default is the Windows `chainloader` item:
+
+```console
+$ cargo run -- entries /tmp/lbxwin/uefi.qcow2
+$ cargo run -- entries /tmp/lbxwin/bios.qcow2
+$ cargo run -- entries /tmp/lbxwin/dual.qcow2
 ```
 
 ### Boot verification

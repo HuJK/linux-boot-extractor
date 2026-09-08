@@ -83,6 +83,19 @@ pub(crate) fn parse_str(text: &str, env: &BTreeMap<String, String>) -> GrubScan 
                 "initrd" | "initrd16" | "initrdefi" => {
                     cur.entry.initrd = words[1..].iter().map(|w| clean_path(w)).collect();
                 }
+                // os-prober writes a `chainloader` item per foreign OS; the
+                // argument is the boot manager to hand over to (options
+                // like `--force` come first). `chainloader +1` (a partition
+                // boot sector) names no file and resolves to nothing.
+                "chainloader" => {
+                    cur.entry.chainloader = words[1..]
+                        .iter()
+                        .find(|w| !w.starts_with('-'))
+                        // `+1` is a block list (a partition's boot sector),
+                        // not a path: keep it verbatim so nothing takes it
+                        // for a file.
+                        .map(|w| if w.starts_with('+') { w.clone() } else { clean_path(w) });
+                }
                 _ => {}
             }
         } else {
@@ -334,6 +347,42 @@ submenu 'Advanced options for Ubuntu' $menuentry_id_option 'gnulinux-advanced-uu
     }
 }
 "#;
+
+    /// os-prober's dual-boot item: no kernel, a `chainloader` target, and
+    /// `set default` pointing at it by id.
+    const OSPROBER: &str = r#"
+set default="osprober-efi-1234-ABCD"
+menuentry 'Debian GNU/Linux' $menuentry_id_option 'debian' {
+    linux /vmlinuz-6.6.9 root=UUID=uuid1 ro
+    initrd /initramfs-6.6.9.img
+}
+menuentry 'Windows Boot Manager (on /dev/sda1)' --class windows $menuentry_id_option 'osprober-efi-1234-ABCD' {
+    insmod part_gpt
+    search --no-floppy --fs-uuid --set=root 1234-ABCD
+    chainloader /EFI/Microsoft/Boot/bootmgfw.efi
+}
+menuentry 'Older Windows (on /dev/sda3)' $menuentry_id_option 'osprober-chain-sda3' {
+    chainloader +1
+}
+"#;
+
+    #[test]
+    fn parses_chainloader_entries() {
+        let scan = parse_str(OSPROBER, &BTreeMap::new());
+        assert_eq!(scan.entries.len(), 3);
+        // The Linux entry is untouched...
+        assert_eq!(scan.entries[0].kernel.as_deref(), Some("/vmlinuz-6.6.9"));
+        assert_eq!(scan.entries[0].chainloader, None);
+        // ...and the foreign ones carry their target instead of a kernel.
+        assert_eq!(scan.entries[1].kernel, None);
+        assert_eq!(
+            scan.entries[1].chainloader.as_deref(),
+            Some("/EFI/Microsoft/Boot/bootmgfw.efi")
+        );
+        assert_eq!(scan.entries[2].chainloader.as_deref(), Some("+1"));
+        // `set default` names it by id: GRUB would boot Windows, not Linux.
+        assert_eq!(scan.default, Some(1));
+    }
 
     #[test]
     fn parses_entries_and_submenu() {

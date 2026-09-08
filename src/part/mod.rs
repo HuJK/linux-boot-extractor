@@ -7,6 +7,16 @@
 mod gpt;
 mod mbr;
 
+/// Well-known GPT partition type GUIDs, in the form [`Partition::type_id`]
+/// carries — for callers that classify partitions by type (see
+/// [`crate::guest`]).
+pub mod gpt_type {
+    pub use super::gpt::{
+        MS_BASIC_DATA, MS_LDM_DATA, MS_LDM_METADATA, MS_RESERVED, MS_STORAGE_SPACES,
+        WINDOWS_RECOVERY,
+    };
+}
+
 use crate::blockdev::{ReadAt, Slice};
 use crate::Result;
 use std::sync::Arc;
@@ -29,6 +39,10 @@ pub struct Partition {
     pub size_bytes: u64,
     /// Human-readable type, e.g. "EFI System", "Linux filesystem", "0x83".
     pub kind: String,
+    /// Machine-readable type as the table stores it: the GPT type GUID, or
+    /// `0xNN` for an MBR type byte. Empty for the whole-disk pseudo-entry.
+    /// Callers match on this (see `guest`) rather than on `kind`'s wording.
+    pub type_id: String,
     /// GPT partition name, if any.
     pub name: Option<String>,
     /// True for types worth probing for boot files (ESP, Linux, XBOOTLDR).
@@ -68,6 +82,7 @@ pub fn scan<D: ReadAt>(disk: &D) -> Result<PartitionTable> {
             start_byte: 0,
             size_bytes: disk.size(),
             kind: "whole disk".into(),
+            type_id: String::new(),
             name: None,
             probe_worthy: true,
             part_uuid: None,

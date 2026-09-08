@@ -7,10 +7,18 @@ const TYPE_EXTENDED_CHS: u8 = 0x05;
 const TYPE_EXTENDED_LBA: u8 = 0x0f;
 const TYPE_GPT_PROTECTIVE: u8 = 0xee;
 
+/// MBR type byte in the same textual form `Partition::type_id` uses for a
+/// GPT type GUID, so callers can match one field for either table.
+pub(crate) fn type_id(t: u8) -> String {
+    format!("{t:#04x}")
+}
+
 fn type_name(t: u8) -> (String, bool) {
     match t {
+        0x07 => ("NTFS/exFAT".into(), false), // also OS/2 IFS; the fs sniffer decides
         0x0b | 0x0c => ("FAT32".into(), true),
         0x0e => ("FAT16 LBA".into(), true),
+        0x27 => ("Windows recovery".into(), false), // hidden NTFS (WinRE)
         0x82 => ("Linux swap".into(), false),
         0x83 => ("Linux".into(), true),
         0x8e => ("Linux LVM".into(), false), // probe once LVM support lands
@@ -86,6 +94,7 @@ pub fn scan<D: ReadAt>(disk: &D) -> Result<Option<PartitionTable>> {
             start_byte: e.start_lba as u64 * SECTOR,
             size_bytes: e.sectors as u64 * SECTOR,
             kind,
+            type_id: type_id(e.type_byte),
             name: None,
             probe_worthy,
             part_uuid: part_uuid(i + 1),
@@ -113,6 +122,7 @@ pub fn scan<D: ReadAt>(disk: &D) -> Result<Option<PartitionTable>> {
                     start_byte: ebr_offset + data.start_lba as u64 * SECTOR,
                     size_bytes: data.sectors as u64 * SECTOR,
                     kind,
+                    type_id: type_id(data.type_byte),
                     name: None,
                     probe_worthy,
                     part_uuid: part_uuid(index),

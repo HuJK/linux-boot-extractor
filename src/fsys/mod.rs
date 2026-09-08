@@ -1,8 +1,11 @@
 //! Filesystem access behind one read-only trait.
 //!
 //! Supported: ext2/3/4 (`ext4-view`), FAT12/16/32 (`fatfs`).
-//! Detected-but-unsupported (XFS, btrfs, squashfs) get a precise error so
-//! users know what they hit. XFS is the next milestone (RHEL 9 /boot).
+//! Detected-but-unsupported (XFS, btrfs, squashfs, NTFS/exFAT/ReFS) get a
+//! precise error so users know what they hit. XFS is the next milestone
+//! (RHEL 9 /boot). The Windows filesystems are detected but deliberately
+//! not read: nothing a direct-kernel boot needs lives on them, and naming
+//! them is what lets [`crate::guest`] recognize a Windows image.
 
 mod ext4;
 mod vfat;
@@ -89,11 +92,22 @@ pub fn detect<D: ReadAt>(dev: &D) -> Result<Option<&'static str>> {
         }
     }
 
-    // FAT: x86 jump at 0 plus an OEM/FS-type marker. fatfs validates the
-    // BPB properly; this is only a cheap pre-filter.
+    // The rest live in the boot sector: read it once.
     if dev.check_bounds(0, 512).is_ok() {
         let mut sector = [0u8; 512];
         dev.read_at(0, &mut sector)?;
+
+        // NTFS / exFAT / ReFS all put their name where FAT keeps the OEM
+        // string (offset 3). Checked before FAT, whose pre-filter is looser.
+        match &sector[3..11] {
+            b"NTFS    " => return Ok(Some("ntfs")),
+            b"EXFAT   " => return Ok(Some("exfat")),
+            b"ReFS\0\0\0\0" => return Ok(Some("refs")),
+            _ => {}
+        }
+
+        // FAT: x86 jump at 0 plus an OEM/FS-type marker. fatfs validates the
+        // BPB properly; this is only a cheap pre-filter.
         let jump_ok = matches!(sector[0], 0xeb | 0xe9);
         let fat32 = &sector[82..90] == b"FAT32   ";
         let fat16 = sector[54..62].starts_with(b"FAT");
